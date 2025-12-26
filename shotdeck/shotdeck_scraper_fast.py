@@ -1,32 +1,38 @@
 #!/usr/bin/env python3
 """
-ShotDeck Comprehensive Scraper
-==============================
+ShotDeck Fast Scraper (Cache Method)
+====================================
 
-This script scrapes video clips from ShotDeck using their search API to access
-the full database of 2.3+ million shots (approximately 400,000+ with video clips).
+This script scrapes video clips from ShotDeck's CDN cache directory.
+It's faster than the comprehensive method but limited to ~1,300 cached clips.
 
 Features:
-- API pagination to discover all shots with video clips
-- On-demand video generation via viewclip endpoint
-- Full metadata extraction and parsing
-- Groups videos by title with corresponding metadata
-- Detailed speed and performance tracking
+- Scrapes CDN directory listing for available clips
+- Fast parallel video downloads
+- All clips are guaranteed to exist (pre-cached)
+- Basic metadata extraction
+- Groups videos by title with metadata
+- Detailed speed tracking
 
 How it works:
-1. Paginates through /browse/searchstillsajax to find shots with data-clip='1'
-2. Triggers video generation by calling /browse/viewclip endpoint
-3. Downloads the generated video from the CDN
-4. Fetches metadata from /browse/shotdetailsajax
-5. Groups all videos by inferred title and saves to JSON
+1. Fetches the directory listing from https://crunch.shotdeck.com/assets/images/clips/
+2. Extracts clip IDs from the Apache-style directory listing
+3. Downloads videos in parallel (guaranteed to exist)
+4. Fetches metadata for each clip
+5. Groups by title and saves to JSON
+
+Limitations:
+- Only accesses cached clips (~1,300 at any time)
+- Cache contents change as users view different clips on the site
+- Does not trigger video generation for uncached clips
 
 Requirements:
 - Python 3.10+
 - requests, beautifulsoup4
-- ShotDeck account with valid session cookie
+- ShotDeck account with valid session cookie (for metadata)
 
 Usage:
-    python shotdeck_scraper_comprehensive.py
+    python shotdeck_scraper_fast.py
 """
 
 import requests
@@ -44,24 +50,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # CONFIGURATION
 # =============================================================================
 
-N_VIDEOS = 2000  # Number of videos to scrape (assignment: ~2,000)
-OUTPUT_DIR = "output"
+N_VIDEOS = 1000  # Number of videos to scrape (max ~1,300 available)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "videos")
 
-# API settings
-API_SHOTS_PER_PAGE = 36  # ShotDeck returns ~36 shots per page
-API_PAGE_DELAY = 0.3     # Seconds between API page requests
-ONLY_WITH_CLIPS = True   # Only retrieve shots that have video clips
-
 # Rate limiting
-METADATA_DELAY = 0.5     # Seconds between metadata requests
-VIDEO_DOWNLOAD_WORKERS = 3  # Parallel video downloads
+METADATA_DELAY = 0.3     # Seconds between metadata requests
+VIDEO_DOWNLOAD_WORKERS = 5  # Parallel video downloads (can be higher since all exist)
 
 # URLs
+CDN_DIRECTORY_URL = "https://crunch.shotdeck.com/assets/images/clips/"
 VIDEO_BASE_URL = "https://crunch.shotdeck.com/assets/images/clips"
 METADATA_BASE_URL = "https://shotdeck.com/browse/shotdetailsajax/image"
-SEARCH_API_URL = "https://shotdeck.com/browse/searchstillsajax"
-VIEWCLIP_URL = "https://crunch.shotdeck.com/browse/viewclip/src/1/s"
 
 # Session cookies - REPLACE with your session cookie from browser
 # To get this:
@@ -81,155 +82,61 @@ HEADERS = {
 
 
 # =============================================================================
-# API SHOT DISCOVERY
+# CDN DIRECTORY SCRAPING
 # =============================================================================
 
-def scrape_api_shots(session: requests.Session, limit: int = None) -> tuple[list[str], dict]:
+def scrape_cdn_directory(limit: int = None) -> list[str]:
     """
-    Scrape shot IDs from ShotDeck's search API.
+    Scrape clip IDs from the CDN directory listing.
     
-    Paginates through /browse/searchstillsajax to get all shot IDs,
-    filtering for shots that have video clips (data-clip='1').
+    The CDN serves an Apache-style directory listing showing all
+    cached video clips. These clips are guaranteed to exist and
+    can be downloaded directly.
     
     Returns:
-        Tuple of (list of shot IDs, stats dict)
+        List of clip IDs (8-character alphanumeric)
     """
-    print("Discovering shots via API...")
-    print(f"  Limit: {limit or 'None (all shots)'}")
-    print(f"  Filter: Only shots with video clips")
-    
-    all_shot_ids = []
-    shots_with_clips = 0
-    shots_without_clips = 0
-    total_shots = None
-    page = 1
-    
-    while True:
-        url = f"{SEARCH_API_URL}/page/{page}"
-        
-        try:
-            response = session.get(url, headers={
-                **HEADERS,
-                "X-Requested-With": "XMLHttpRequest"
-            }, timeout=30)
-            
-            if response.status_code != 200:
-                print(f"  HTTP {response.status_code} on page {page}, stopping.")
-                break
-            
-            html = response.text
-            
-            # Extract total shots count on first page
-            if total_shots is None:
-                match = re.search(r'totalShots\s*=\s*(\d+)', html)
-                if match:
-                    total_shots = int(match.group(1))
-                    print(f"  Total shots in database: {total_shots:,}")
-            
-            # Parse shot IDs from HTML
-            soup = BeautifulSoup(html, 'html.parser')
-            page_shots = []
-            
-            for div in soup.find_all('div', class_='outerimage'):
-                shot_id = div.get('data-shotid')
-                has_clip = div.get('data-clip') == '1'
-                
-                if shot_id:
-                    if has_clip:
-                        shots_with_clips += 1
-                        if ONLY_WITH_CLIPS:
-                            page_shots.append(shot_id)
-                    else:
-                        shots_without_clips += 1
-                        if not ONLY_WITH_CLIPS:
-                            page_shots.append(shot_id)
-            
-            if not page_shots and ONLY_WITH_CLIPS:
-                # No clips on this page, but continue searching
-                pass
-            
-            all_shot_ids.extend(page_shots)
-            
-            # Progress update every 50 pages
-            if page % 50 == 0:
-                print(f"  Page {page}: {len(all_shot_ids)} shots collected")
-            
-            # Check limits
-            if limit and len(all_shot_ids) >= limit:
-                all_shot_ids = all_shot_ids[:limit]
-                print(f"  Reached limit of {limit} shots")
-                break
-            
-            if total_shots and page * API_SHOTS_PER_PAGE >= total_shots:
-                break
-            
-            # Check if page had no results
-            if not soup.find_all('div', class_='outerimage'):
-                break
-            
-            page += 1
-            time.sleep(API_PAGE_DELAY)
-            
-        except requests.RequestException as e:
-            print(f"  Error on page {page}: {e}")
-            break
-    
-    stats = {
-        'total_in_database': total_shots,
-        'pages_scraped': page,
-        'shots_with_clips': shots_with_clips,
-        'shots_without_clips': shots_without_clips,
-        'shots_collected': len(all_shot_ids),
-    }
-    
-    print(f"\n  API Discovery Complete:")
-    print(f"    Pages scraped: {page}")
-    print(f"    Shots with video: {shots_with_clips}")
-    print(f"    Shots collected: {len(all_shot_ids)}")
-    
-    return all_shot_ids, stats
-
-
-# =============================================================================
-# VIDEO GENERATION AND DOWNLOAD
-# =============================================================================
-
-def trigger_video_generation(shot_id: str, session: requests.Session) -> dict | None:
-    """
-    Trigger video clip generation by calling the viewclip endpoint.
-    
-    ShotDeck generates video clips on-demand. This endpoint triggers
-    the generation process and returns the video URL.
-    """
-    url = f"{VIEWCLIP_URL}/{shot_id}"
+    print("Scraping CDN directory listing...")
     
     try:
-        response = session.get(url, headers={
-            **HEADERS,
-            "X-Requested-With": "XMLHttpRequest"
-        }, timeout=30)
+        response = requests.get(CDN_DIRECTORY_URL, headers=HEADERS, timeout=60)
+        response.raise_for_status()
         
-        if response.status_code == 200 and response.text.strip():
-            try:
-                data = json.loads(response.text)
-                if isinstance(data, list) and len(data) >= 2:
-                    return {
-                        "filename": data[0],
-                        "url": data[1],
-                        "framerate": data[2] if len(data) > 2 else None,
-                        "type": data[3] if len(data) > 3 else None,
-                    }
-            except json.JSONDecodeError:
-                pass
-        return None
-    except requests.RequestException:
-        return None
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        clip_ids = set()
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            # Match pattern: XXXXXXXX_clip.mp4
+            match = re.match(r'^([A-Z0-9]{8})_clip\.mp4$', href)
+            if match:
+                clip_ids.add(match.group(1))
+        
+        clip_ids = sorted(list(clip_ids))
+        print(f"  Found {len(clip_ids)} cached clips")
+        
+        if limit and len(clip_ids) > limit:
+            clip_ids = clip_ids[:limit]
+            print(f"  Limited to {limit} clips")
+        
+        return clip_ids
+        
+    except requests.RequestException as e:
+        print(f"  Error: {e}")
+        return []
 
 
-def download_video(shot_id: str, output_dir: str, session: requests.Session) -> dict:
+# =============================================================================
+# VIDEO DOWNLOAD
+# =============================================================================
+
+def download_video(shot_id: str, output_dir: str) -> dict:
     """
-    Download a video clip, triggering generation if needed.
+    Download a video clip from the CDN.
+    
+    Since we're using the cache method, all clips are guaranteed to exist.
     """
+    url = f"{VIDEO_BASE_URL}/{shot_id}_clip.mp4"
     filepath = os.path.join(output_dir, f"{shot_id}_clip.mp4")
     
     # Skip if already downloaded
@@ -237,16 +144,8 @@ def download_video(shot_id: str, output_dir: str, session: requests.Session) -> 
         size = os.path.getsize(filepath)
         return {"shot_id": shot_id, "path": filepath, "size_bytes": size, "status": "exists"}
     
-    # Trigger video generation
-    clip_info = trigger_video_generation(shot_id, session)
-    if clip_info:
-        url = clip_info.get("url", f"{VIDEO_BASE_URL}/{shot_id}_clip.mp4")
-        time.sleep(0.3)  # Brief delay for generation
-    else:
-        url = f"{VIDEO_BASE_URL}/{shot_id}_clip.mp4"
-    
     try:
-        response = requests.get(url, stream=True, timeout=120)
+        response = requests.get(url, stream=True, timeout=60)
         
         if response.status_code == 200:
             with open(filepath, 'wb') as f:
@@ -274,43 +173,16 @@ def parse_metadata_html(html: str, shot_id: str) -> dict:
         'tag': 'tags', 'tags': 'tags',
         'genre': 'genre', 'genres': 'genre',
         'director': 'director', 'directors': 'director',
-        'cinematographer': 'cinematographer', 'dop': 'cinematographer', 'dp': 'cinematographer',
-        'production designer': 'production_designer',
-        'costume designer': 'costume_designer',
-        'editor': 'editor', 'editors': 'editor',
-        'colorist': 'colorist',
-        'color': 'color',
+        'cinematographer': 'cinematographer',
         'actors': 'actors', 'actor': 'actors', 'cast': 'actors',
-        'time period': 'time_period',
         'year': 'year',
-        'aspect ratio': 'aspect_ratio',
-        'format': 'format',
-        'frame size': 'frame_size',
-        'shot type': 'shot_type',
-        'lens size': 'lens_size',
-        'composition': 'composition',
-        'lighting': 'lighting',
-        'lighting type': 'lighting_type',
-        'time of day': 'time_of_day',
-        'interior/exterior': 'interior_exterior',
-        'location type': 'location_type',
-        'set': 'set',
-        'story location': 'story_location',
-        'filming location': 'filming_location',
+        'time period': 'time_period',
         'title': 'title', 'movie': 'title', 'film': 'title',
         'music genre': 'music_genre',
         'video genre': 'video_genre',
-        'stylist': 'stylist',
-        'production company': 'production_company',
     }
     
-    LIST_FIELDS = {
-        'tags', 'genre', 'director', 'cinematographer', 'actors', 'color',
-        'shot_type', 'lens_size', 'composition', 'lighting', 'lighting_type',
-        'set', 'story_location', 'filming_location', 'editor', 'colorist',
-        'production_designer', 'costume_designer', 'music_genre', 'video_genre',
-        'stylist', 'production_company',
-    }
+    LIST_FIELDS = {'tags', 'genre', 'director', 'cinematographer', 'actors', 'music_genre', 'video_genre'}
     
     for detail_group in soup.find_all('div', class_='detail-group'):
         label_elem = detail_group.find('p', class_='detail-type')
@@ -339,7 +211,6 @@ def parse_metadata_html(html: str, shot_id: str) -> dict:
             else:
                 metadata[field_name] = values[0] if len(values) == 1 else values
     
-    # Look for title in other places
     if 'title' not in metadata:
         title_link = soup.find('a', class_='movie-link')
         if title_link:
@@ -412,11 +283,7 @@ def group_by_title(all_metadata: list[dict]) -> dict:
                 "year": item.get('year') or item.get('time_period'),
             }
         
-        shot_info = {
-            "shot_id": item.get('shot_id'),
-            "video_url": f"{VIDEO_BASE_URL}/{item.get('shot_id')}_clip.mp4",
-        }
-        
+        shot_info = {"shot_id": item.get('shot_id')}
         for key, value in item.items():
             if key not in ['shot_id'] and value:
                 shot_info[key] = value
@@ -438,69 +305,48 @@ def group_by_title(all_metadata: list[dict]) -> dict:
 
 def main():
     print("=" * 60)
-    print("ShotDeck Comprehensive Scraper")
+    print("ShotDeck Fast Scraper (Cache Method)")
     print("=" * 60)
     print(f"Target: {N_VIDEOS} videos")
     print()
     
-    # Check cookies
-    if COOKIES.get("PHPSESSID") == "YOUR_SESSION_ID_HERE":
-        print("ERROR: Please set your PHPSESSID cookie!")
-        print("1. Log into shotdeck.com")
-        print("2. Open DevTools > Application > Cookies")
-        print("3. Copy PHPSESSID value to this script")
-        return
+    # Check cookies (only needed for metadata)
+    cookies_valid = COOKIES.get("PHPSESSID") != "YOUR_SESSION_ID_HERE"
+    if not cookies_valid:
+        print("WARNING: No session cookie set.")
+        print("Videos will download but metadata will be limited.")
+        print()
     
     os.makedirs(VIDEO_DIR, exist_ok=True)
     
     session = requests.Session()
-    session.cookies.update(COOKIES)
+    if cookies_valid:
+        session.cookies.update(COOKIES)
     
     # Track timing
     total_start = datetime.now()
     
-    # Step 1: Discover shots via API
-    print("\n[STEP 1] Discovering shots via API")
+    # Step 1: Get clip IDs from CDN directory
+    print("\n[STEP 1] Scraping CDN directory")
     print("-" * 40)
-    api_start = datetime.now()
-    shot_ids, api_stats = scrape_api_shots(session, limit=N_VIDEOS)
-    api_time = (datetime.now() - api_start).total_seconds()
+    discovery_start = datetime.now()
+    clip_ids = scrape_cdn_directory(limit=N_VIDEOS)
+    discovery_time = (datetime.now() - discovery_start).total_seconds()
     
-    if not shot_ids:
-        print("No shots found!")
+    if not clip_ids:
+        print("No clips found!")
         return
     
-    # Step 2: Fetch metadata
-    print(f"\n[STEP 2] Fetching metadata for {len(shot_ids)} shots")
-    print("-" * 40)
-    metadata_start = datetime.now()
-    all_metadata = []
-    
-    for i, shot_id in enumerate(shot_ids, 1):
-        metadata = fetch_metadata(session, shot_id)
-        if metadata:
-            all_metadata.append(metadata)
-        else:
-            all_metadata.append({"shot_id": shot_id})
-        
-        if i % 100 == 0:
-            print(f"  {i}/{len(shot_ids)} metadata fetched")
-        
-        time.sleep(METADATA_DELAY)
-    
-    metadata_time = (datetime.now() - metadata_start).total_seconds()
-    print(f"  Metadata fetched: {len(all_metadata)}")
-    
-    # Step 3: Download videos
-    print(f"\n[STEP 3] Downloading videos")
+    # Step 2: Download videos in parallel
+    print(f"\n[STEP 2] Downloading {len(clip_ids)} videos")
     print("-" * 40)
     download_start = datetime.now()
     download_results = []
     
     with ThreadPoolExecutor(max_workers=VIDEO_DOWNLOAD_WORKERS) as executor:
         futures = {
-            executor.submit(download_video, shot_id, VIDEO_DIR, session): shot_id
-            for shot_id in shot_ids
+            executor.submit(download_video, clip_id, VIDEO_DIR): clip_id
+            for clip_id in clip_ids
         }
         
         completed = 0
@@ -510,9 +356,33 @@ def main():
             completed += 1
             
             if completed % 100 == 0:
-                print(f"  {completed}/{len(shot_ids)} videos processed")
+                print(f"  {completed}/{len(clip_ids)} videos processed")
     
     download_time = (datetime.now() - download_start).total_seconds()
+    
+    # Step 3: Fetch metadata
+    print(f"\n[STEP 3] Fetching metadata")
+    print("-" * 40)
+    metadata_start = datetime.now()
+    all_metadata = []
+    
+    if cookies_valid:
+        for i, clip_id in enumerate(clip_ids, 1):
+            metadata = fetch_metadata(session, clip_id)
+            if metadata:
+                all_metadata.append(metadata)
+            else:
+                all_metadata.append({"shot_id": clip_id})
+            
+            if i % 100 == 0:
+                print(f"  {i}/{len(clip_ids)} metadata fetched")
+            
+            time.sleep(METADATA_DELAY)
+    else:
+        all_metadata = [{"shot_id": clip_id} for clip_id in clip_ids]
+        print("  Skipped (no session cookie)")
+    
+    metadata_time = (datetime.now() - metadata_start).total_seconds()
     
     # Merge download info with metadata
     download_map = {r['shot_id']: r for r in download_results}
@@ -537,22 +407,22 @@ def main():
     # Save results
     output = {
         "scraped_at": datetime.now().isoformat(),
-        "method": "comprehensive_api",
+        "method": "fast_cdn_cache",
         "stats": {
-            "total_shots_requested": len(shot_ids),
+            "clips_in_cache": len(clip_ids),
             "videos_downloaded": downloaded_count,
             "videos_failed": failed_count,
             "metadata_retrieved": len([m for m in all_metadata if len(m) > 1]),
             "total_size_mb": round(total_size / (1024 * 1024), 2),
             "unique_groups": len(grouped_data),
             "timing": {
-                "api_discovery_seconds": round(api_time, 1),
-                "metadata_fetch_seconds": round(metadata_time, 1),
-                "video_download_seconds": round(download_time, 1),
+                "discovery_seconds": round(discovery_time, 1),
+                "download_seconds": round(download_time, 1),
+                "metadata_seconds": round(metadata_time, 1),
                 "total_seconds": round(total_time, 1),
             },
             "speed": {
-                "videos_per_second": round(downloaded_count / total_time, 3) if total_time > 0 else 0,
+                "videos_per_second": round(downloaded_count / download_time, 3) if download_time > 0 else 0,
                 "mb_per_second": round((total_size / (1024 * 1024)) / download_time, 2) if download_time > 0 else 0,
             }
         },
@@ -567,15 +437,15 @@ def main():
     print(f"\n{'=' * 60}")
     print("SCRAPING COMPLETE")
     print("=" * 60)
-    print(f"Videos downloaded: {downloaded_count}/{len(shot_ids)}")
+    print(f"Videos downloaded: {downloaded_count}/{len(clip_ids)}")
     print(f"Videos failed: {failed_count}")
     print(f"Unique groups: {len(grouped_data)}")
     print(f"Total size: {output['stats']['total_size_mb']:.2f} MB")
     print()
     print("TIMING:")
-    print(f"  API discovery: {api_time:.1f}s")
-    print(f"  Metadata fetch: {metadata_time:.1f}s")
+    print(f"  CDN discovery: {discovery_time:.1f}s")
     print(f"  Video download: {download_time:.1f}s")
+    print(f"  Metadata fetch: {metadata_time:.1f}s")
     print(f"  Total: {total_time:.1f}s")
     print()
     print("SPEED:")
